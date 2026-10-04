@@ -27,6 +27,7 @@ from app.services.document_pipeline import (
     apply_verdict,
     require_submission_documents,
     RETIRED_DOCUMENT_TYPES,
+    _demo_statement,
 )
 
 
@@ -283,6 +284,26 @@ def submit_application(
         bank_features,
         document_report["bankStatement"].get("period"),
     )
+    # TEMPORARY DEMO OVERRIDE: keep the three presentation accounts' final
+    # decision and transaction explanation fixed. Remove after presentation.
+    demo_statement = _demo_statement(user)
+    if demo_statement:
+        if demo_statement["decision"] == "DECLINE":
+            result["prediction"] = "DECLINE"
+            result["probability"] = 0.10
+            transaction_reasoning["summary"] = (
+                "DEMO OVERRIDE — REJECTED. Irregular income and overdraft "
+                "days detected in the last 3 months contributed to this "
+                "decision."
+            )
+        else:
+            result["prediction"] = "APPROVE"
+            result["probability"] = 0.90
+            transaction_reasoning["summary"] = (
+                "DEMO OVERRIDE — APPROVED. Consistent monthly income and "
+                "healthy average balance contributed to this decision."
+            )
+        transaction_reasoning["demoOverride"] = True
     model_decision = result["prediction"]
     result["prediction"] = apply_verdict(
         model_decision, document_report["verdict"]

@@ -52,6 +52,89 @@ SLOT_LABELS = {
 RETIRED_DOCUMENT_TYPES = {"EMPLOYMENT_INCOME_PROOF", "INCOME_CERTIFICATE"}
 
 
+# TEMPORARY DEMO OVERRIDES: keyed only by the registered account name. Remove
+# this block after the presentation; all other applicants use the real parser.
+DEMO_STATEMENTS = {
+    "aanika pillai": {
+        "account_holder": "Aanika Pillai",
+        "decision": "APPROVE",
+        "bank_name": "HDFC Bank", "branch": "Mumbai Main Branch",
+        "account_number": "XXXXXX4821", "ifsc": "HDFC0000123",
+        "transactions": [
+            ("2026-07-05", "Monthly Salary Credit", 0, 82000, 142000),
+            ("2026-07-14", "Rent Transfer", 32000, 0, 110000),
+            ("2026-07-25", "ATM Cash Withdrawal", 5000, 0, 105000),
+            ("2026-08-05", "Monthly Salary Credit", 0, 82000, 187000),
+            ("2026-08-14", "Utility Payment", 8500, 0, 178500),
+            ("2026-08-25", "Groceries and Shopping", 12000, 0, 166500),
+            ("2026-09-05", "Monthly Salary Credit", 0, 82000, 248500),
+            ("2026-09-14", "Rent Transfer", 32000, 0, 216500),
+            ("2026-09-25", "ATM Cash Withdrawal", 4000, 0, 212500),
+        ],
+    },
+    "riya mishra": {
+        "account_holder": "Riya Mishra",
+        "decision": "DECLINE",
+        "bank_name": "HDFC Bank", "branch": "New Delhi Branch",
+        "account_number": "XXXXXX7394", "ifsc": "HDFC0000456",
+        "transactions": [
+            ("2026-07-05", "Freelance Transfer", 0, 18000, 21000),
+            ("2026-07-14", "ATM Cash Withdrawal", 18000, 0, 3000),
+            ("2026-07-15", "Returned payment; overdraft", 3500, 0, -500),
+            ("2026-07-16", "One-time family transfer", 0, 2500, 2000),
+            ("2026-08-05", "Ad hoc Client Payment", 0, 12000, 14000),
+            ("2026-08-14", "ATM Cash Withdrawal", 14000, 0, 0),
+            ("2026-08-15", "Overdraft fee and debit", 200, 0, -200),
+            ("2026-08-16", "One-time refund", 0, 1200, 1000),
+            ("2026-09-05", "Irregular cash deposit", 0, 6000, 7000),
+            ("2026-09-14", "ATM Cash Withdrawal", 6500, 0, 500),
+        ],
+    },
+    "mrunmai magade": {
+        "account_holder": "Mrunmai Magade",
+        "decision": "APPROVE",
+        "bank_name": "State Bank of India", "branch": "Pune Camp Branch",
+        "account_number": "XXXXXX6158", "ifsc": "SBIN0000789",
+        "transactions": [
+            ("2026-07-03", "Salary Credit - Meridian Labs", 0, 67500, 112500),
+            ("2026-07-12", "Home and household expenses", 24500, 0, 88000),
+            ("2026-07-24", "ATM Cash Withdrawal", 3000, 0, 85000),
+            ("2026-08-03", "Salary Credit - Meridian Labs", 0, 70500, 155500),
+            ("2026-08-12", "Rent and utilities", 28000, 0, 127500),
+            ("2026-08-24", "Card payment", 9500, 0, 118000),
+            ("2026-09-03", "Salary Credit - Meridian Labs", 0, 69000, 187000),
+            ("2026-09-12", "Home and household expenses", 26000, 0, 161000),
+            ("2026-09-24", "ATM Cash Withdrawal", 3500, 0, 157500),
+        ],
+    },
+}
+
+
+DEMO_STATEMENT_ALIASES = {
+    # Existing demo registration contains this name verbatim.
+    "33_riya mishra_it3": "riya mishra",
+}
+
+
+def _demo_statement(user):
+    """Match against the registered account name, never a document/OCR name."""
+    registered_name = " ".join((user.full_name or "").split())
+    normalized_name = registered_name.casefold()
+    profile_name = DEMO_STATEMENT_ALIASES.get(
+        normalized_name, normalized_name
+    )
+    match = DEMO_STATEMENTS.get(profile_name)
+    current_app.logger.info(
+        "Temporary statement demo name check: user_id=%s "
+        "registered_full_name=%r normalized_name=%r matched_profile=%r",
+        user.id,
+        user.full_name,
+        normalized_name,
+        profile_name if match else None,
+    )
+    return match
+
+
 class DocumentPolicyError(ValueError):
     def __init__(self, message, status_code=422, errors=None):
         super().__init__(message)
@@ -175,6 +258,8 @@ def account_identity(fields, registered_name):
 def upload(user, file, slot):
     if slot not in SLOTS:
         raise ExtractionError("Unsupported document slot.")
+    # Resolve demo accounts before OCR, CSV validation, or statement parsing.
+    demo_statement = _demo_statement(user) if slot == "bank_statement" else None
     limit = current_app.config.get("MAX_DOCUMENT_SIZE_BYTES", 5 * 1024 * 1024)
     data = file.stream.read(limit + 1)
     if not data or len(data) > limit:
@@ -185,13 +270,12 @@ def upload(user, file, slot):
     try:
         mime, extension = detect_type(data)
     except ExtractionError:
-        if slot != "bank_statement":
+        if slot != "bank_statement" or not demo_statement:
             raise
         try:
             text = data.decode("utf-8-sig")
             if "\x00" in text:
                 raise ValueError()
-            parse_statement(text, csv_mode=True)
         except (UnicodeError, ValueError):
             raise ExtractionError(
                 "Expected a valid PDF/image or normalized bank CSV."
@@ -200,6 +284,10 @@ def upload(user, file, slot):
     if csv_mode:
         text = data.decode("utf-8-sig")
         metadata, tables = {}, []
+        extraction_warning = None
+    elif demo_statement:
+        # Keep the original upload, but skip OCR for temporary demo profiles.
+        text, metadata, tables = "", {}, []
         extraction_warning = None
     else:
         try:
@@ -278,14 +366,39 @@ def upload(user, file, slot):
         if pan:
             fields["pan"] = "******" + pan.group()[-4:]
     if slot == "bank_statement":
-        fields.update(extract_bank_header(text))
+        if demo_statement:
+            fields.update({
+                "account_holder": demo_statement["account_holder"],
+                "account_number": demo_statement["account_number"],
+                "bank_name": demo_statement["bank_name"],
+                "branch": demo_statement["branch"],
+                "ifsc": demo_statement["ifsc"],
+            })
+        else:
+            fields.update(extract_bank_header(text))
         fields["name"] = fields["account_holder"]
     _log_ocr_diagnostics(text, slot, fields, detected_type)
-    ownership = account_identity(fields, user.full_name)
+    ownership = account_identity(
+        fields,
+        demo_statement["account_holder"] if demo_statement else user.full_name,
+    )
     checks.append(ownership)
     if slot == "bank_statement":
         try:
-            transactions = parse_statement(text, tables, csv_mode)
+            # TEMPORARY DEMO OVERRIDE: ignore uploaded statement contents for
+            # the named demo accounts; all other accounts use parse_statement.
+            transactions = (
+                [
+                    {
+                        "date": date.fromisoformat(row[0]).isoformat(),
+                        "description": row[1], "debit": row[2],
+                        "credit": row[3], "balance": row[4],
+                    }
+                    for row in demo_statement["transactions"]
+                ]
+                if demo_statement
+                else parse_statement(text, tables, csv_mode)
+            )
             if transactions:
                 statement_end = date.fromisoformat(transactions[-1]["date"])
                 cutoff = statement_end - timedelta(days=89)
@@ -438,7 +551,11 @@ def build_report(user_id, application_id=None, persist=False):
             )
             continue
         slot_checks = [c for c in row.checks if c["name"] != "identity_name"]
-        slot_checks.append(account_identity(row.fields, account.full_name))
+        demo_statement = _demo_statement(account) if slot == "bank_statement" else None
+        slot_checks.append(account_identity(
+            row.fields,
+            demo_statement["account_holder"] if demo_statement else account.full_name,
+        ))
         if slot == "aadhaar" and not row.fields.get("dob"):
             slot_checks.append(
                 check(
